@@ -1,0 +1,75 @@
+version: '3.8'
+
+services:
+  go-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: puzzleradar-go-worker
+    environment:
+      - HUB_URL=http://host.docker.internal:3010
+      - WORKER_NAME=local-go-worker-01
+      - LANES=1024
+      - LOG_LEVEL=debug
+      - HARDWARE_TYPE=CPU_GO_MONTGOMERY
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 4G
+        reservations:
+          cpus: '1'
+          memory: 2G
+    networks:
+      - puzzleradar-network
+
+  # Para testar com PuzzleRadar local
+  puzzleradar:
+    image: node:20-alpine
+    container_name: puzzleradar-local
+    working_dir: /app
+    command: sh -c "npm install && npm run dev"
+    volumes:
+      - ../PuzzleRadar:/app
+    ports:
+      - "3010:3010"
+    environment:
+      - NODE_ENV=development
+      - PORT=3010
+      - DATABASE_URL=postgresql://postgres:postgres@db:5432/puzzleradar
+      - REDIS_URL=redis://redis:6379
+    depends_on:
+      - db
+      - redis
+    networks:
+      - puzzleradar-network
+
+  db:
+    image: postgres:16-alpine
+    container_name: puzzleradar-db
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_DB=puzzleradar
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    networks:
+      - puzzleradar-network
+
+  redis:
+    image: redis:7-alpine
+    container_name: puzzleradar-redis
+    ports:
+      - "6379:6379"
+    networks:
+      - puzzleradar-network
+
+networks:
+  puzzleradar-network:
+    driver: bridge
+
+volumes:
+  pgdata:

@@ -1,0 +1,11 @@
+# Binaries
+*.exe
+worker_linux_amd64
+worker
+bitcoin_finder
+bitcoin_finder.exe
+
+# Temporary / keys
+found_key_*.txt
+temp/
+*.log
