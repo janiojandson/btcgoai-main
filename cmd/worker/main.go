@@ -41,6 +41,8 @@ type Config struct {
 	CPUPercent  int
 	Threads     int
 	StealthMode bool
+	Puzzle      int
+	TestMode    bool
 }
 
 type RangeAssignment struct {
@@ -102,6 +104,16 @@ type WebhookReq struct {
 	LoteID       string `json:"lote_id,omitempty"`
 }
 
+type MilestoneReq struct {
+	WorkerID    string `json:"worker_id"`
+	Milestone   int    `json:"milestone"`
+	CurrentKey  string `json:"current_key"`
+	Hashrate    uint64 `json:"hashrate"`
+	KeysDelta   uint64 `json:"keys_delta"`
+	LoteID      string `json:"lote_id"`
+	Timestamp   string `json:"timestamp"`
+}
+
 var (
 	version = "1.0.0"
 )
@@ -112,6 +124,7 @@ func main() {
 	cpuFlag := flag.Int("cpu", 0, "CPU usage percent (1-100), overrides CPU_PERCENT env")
 	threadsFlag := flag.Int("threads", 0, "Manual thread override, overrides THREADS env")
 	stealthFlag := flag.Bool("stealth", false, "Stealth mode for academic/cloud environments")
+	puzzleFlag := flag.Int("puzzle", 0, "Puzzle number (71, 130, etc). Overrides PUZZLE env. Use 'test' or 0 for test mode")
 	flag.Parse()
 
 	if *cpuFlag > 0 {
@@ -122,6 +135,13 @@ func main() {
 	}
 	if *stealthFlag {
 		cfg.StealthMode = true
+	}
+	if *puzzleFlag > 0 {
+		cfg.Puzzle = *puzzleFlag
+		if cfg.Puzzle == -1 || cfg.Puzzle == 0 {
+			cfg.TestMode = true
+			cfg.Puzzle = 10
+		}
 	}
 
 	if cfg.CPUPercent < 1 {
@@ -196,6 +216,14 @@ func loadConfig() Config {
 
 	stealthMode := getEnv("STEALTH_MODE", "false") == "true"
 
+	puzzleStr := getEnv("PUZZLE", "71")
+	puzzle, _ := strconv.Atoi(puzzleStr)
+	if puzzle <= 0 {
+		puzzle = 71
+	}
+
+	testMode := getEnv("TEST_MODE", "false") == "true"
+
 	return Config{
 		HubURL:      strings.TrimSuffix(hubURL, "/"),
 		WorkerName:  workerName,
@@ -204,6 +232,8 @@ func loadConfig() Config {
 		CPUPercent:  cpuPercent,
 		Threads:     threads,
 		StealthMode: stealthMode,
+		Puzzle:      puzzle,
+		TestMode:    testMode,
 	}
 }
 
@@ -247,10 +277,13 @@ func runWorkerLoop(client *http.Client, cfg Config) {
 	h := newHash160er()
 
 	var (
-	found       atomic.Bool
-	totalIter   uint64
-	startTime   = time.Now()
-	keysChecked uint64
+		found             atomic.Bool
+		totalIter         uint64
+		startTime         = time.Now()
+		lastHeartbeatKeys uint64
+		lastHeartbeatTime = time.Now()
+		lastMilestone     int
+		lastRealHashrate  uint64
 	)
 
 	heartbeatTicker := time.NewTicker(10 * time.Second)
@@ -292,6 +325,7 @@ func runWorkerLoop(client *http.Client, cfg Config) {
 
 		ls := newLaneSet(bases)
 		var tick uint64
+		lastMilestone = 0
 
 		for {
 			if found.Load() {
@@ -300,7 +334,15 @@ func runWorkerLoop(client *http.Client, cfg Config) {
 
 			select {
 			case <-heartbeatTicker.C:
-				sendHeartbeat(client, cfg, rangeData.LoteID, keysChecked, totalKeys, startBig, tick)
+				now := time.Now()
+				elapsedSecs := now.Sub(lastHeartbeatTime).Seconds()
+				deltaKeys := atomic.LoadUint64(&totalIter) - lastHeartbeatKeys
+				if elapsedSecs > 0 {
+					lastRealHashrate = uint64(float64(deltaKeys) / elapsedSecs)
+				}
+				sendHeartbeat(client, cfg, rangeData.LoteID, atomic.LoadUint64(&totalIter), totalKeys, startBig, tick, lastRealHashrate)
+				lastHeartbeatKeys = atomic.LoadUint64(&totalIter)
+				lastHeartbeatTime = now
 			default:
 			}
 
@@ -311,7 +353,7 @@ func runWorkerLoop(client *http.Client, cfg Config) {
 					keyHex := padPrivateKey(key.Bytes(), 32)
 					found.Store(true)
 					if stealth {
-						logInfo(stealth, "[BENCHMARK] Match found | Type: %s | Ops: %d", target.Type, keysChecked)
+						logInfo(stealth, "[BENCHMARK] Match found | Type: %s | Ops: %d", target.Type, atomic.LoadUint64(&totalIter))
 					} else {
 						logInfo(stealth, "\n🎉🎉🎉 [DESCOBERTA] CHAVE ENCONTRADA! Type: %s | Key: %s | Addr: %s 🎉🎉🎉\n", target.Type, keyHex, target.Address)
 					}
@@ -322,8 +364,17 @@ func runWorkerLoop(client *http.Client, cfg Config) {
 			})
 
 			atomic.AddUint64(&totalIter, uint64(cfg.Lanes))
-			keysChecked = atomic.LoadUint64(&totalIter)
 			tick++
+
+			currentKeys := atomic.LoadUint64(&totalIter)
+			currentMilestone := int(new(big.Int).Div(new(big.Int).Mul(new(big.Int).SetUint64(currentKeys), big.NewInt(10)), totalKeys).Uint64())
+			if currentMilestone > lastMilestone && currentMilestone <= 10 {
+				for m := lastMilestone + 1; m <= currentMilestone; m++ {
+					currentKey := new(big.Int).Add(startBig, big.NewInt(int64(tick)))
+					go sendMilestone(client, cfg, rangeData.LoteID, m, currentKey, lastRealHashrate, currentKeys-lastHeartbeatKeys)
+				}
+				lastMilestone = currentMilestone
+			}
 
 			if matched {
 				break
@@ -340,14 +391,17 @@ func runWorkerLoop(client *http.Client, cfg Config) {
 			break
 		}
 
-		sendRangeScanned(client, cfg, rangeData.LoteID, startHex, keysChecked)
+		sendRangeScanned(client, cfg, rangeData.LoteID, startHex, atomic.LoadUint64(&totalIter))
 	}
 
-	sendFinalStats(cfg, keysChecked, time.Since(startTime))
+	sendFinalStats(cfg, atomic.LoadUint64(&totalIter), time.Since(startTime))
 }
 
 func fetchRange(client *http.Client, cfg Config) (*RangeAssignment, error) {
-	url := fmt.Sprintf("%s/api/range/next/%s?client=go&hashrate=%d", cfg.HubURL, cfg.WorkerName, estimateHashrate(cfg.Lanes))
+	url := fmt.Sprintf("%s/api/range/next/%s?client=go&hashrate=%d&puzzle=%d", cfg.HubURL, cfg.WorkerName, estimateHashrate(cfg.Lanes), cfg.Puzzle)
+	if cfg.TestMode {
+		url += "&test=true"
+	}
 	req, _ := http.NewRequest("GET", url, nil)
 	req.Header.Set("Accept", "application/json")
 
@@ -371,7 +425,7 @@ func fetchRange(client *http.Client, cfg Config) (*RangeAssignment, error) {
 	return &data, nil
 }
 
-func sendHeartbeat(client *http.Client, cfg Config, loteID string, keysChecked uint64, totalKeys *big.Int, startBig *big.Int, tick uint64) {
+func sendHeartbeat(client *http.Client, cfg Config, loteID string, keysChecked uint64, totalKeys *big.Int, startBig *big.Int, tick uint64, realHashrate uint64) {
 	progress := "0.0"
 	if totalKeys.Sign() > 0 {
 		pct := float64(keysChecked) / float64(totalKeys.Uint64()) * 100
@@ -379,7 +433,11 @@ func sendHeartbeat(client *http.Client, cfg Config, loteID string, keysChecked u
 	}
 
 	currentKey := new(big.Int).Add(startBig, big.NewInt(int64(tick)))
-	hashrate := estimateHashrate(cfg.Lanes)
+	
+	hashrate := realHashrate
+	if hashrate == 0 {
+		hashrate = estimateHashrate(cfg.Lanes)
+	}
 
 	payload := HeartbeatReq{
 		WorkerID:    cfg.WorkerName,
@@ -398,12 +456,29 @@ func sendHeartbeat(client *http.Client, cfg Config, loteID string, keysChecked u
 	client.Do(req)
 }
 
+func sendMilestone(client *http.Client, cfg Config, loteID string, milestone int, currentKey *big.Int, hashrate uint64, keysDelta uint64) {
+	payload := MilestoneReq{
+		WorkerID:   cfg.WorkerName,
+		Milestone:  milestone,
+		CurrentKey: "0x" + padPrivateKey(currentKey.Bytes(), 32),
+		Hashrate:   hashrate,
+		KeysDelta:  keysDelta,
+		LoteID:     loteID,
+		Timestamp:  time.Now().UTC().Format(time.RFC3339),
+	}
+
+	body, _ := json.Marshal(payload)
+	req, _ := http.NewRequest("POST", cfg.HubURL+"/api/workers/worker/milestone", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	client.Do(req)
+}
+
 func submitKeyFound(client *http.Client, cfg Config, loteID, keyHex string, target Target) {
 	payload := KeyFoundReq{
 		Status:       "keyFound",
 		PrivateKey:   keyHex,
 		WorkerName:   cfg.WorkerName,
-		TargetPuzzle: "71",
+		TargetPuzzle: strconv.Itoa(cfg.Puzzle),
 		LoteID:       loteID,
 	}
 	body, _ := json.Marshal(payload)
@@ -423,7 +498,7 @@ func sendRangeScanned(client *http.Client, cfg Config, loteID, startHex string, 
 		Status:       "rangeScanned",
 		Hex:          startHex,
 		WorkerName:   cfg.WorkerName,
-		TargetPuzzle: "71",
+		TargetPuzzle: strconv.Itoa(cfg.Puzzle),
 		Hashrate:     fmt.Sprintf("%.2f kH/s", float64(estimateHashrate(cfg.Lanes))/1000),
 		LoteID:       loteID,
 	}
