@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"flag"
@@ -136,6 +137,24 @@ type WebhookReq struct {
 	LoteID       string `json:"lote_id,omitempty"`
 }
 
+type BenchmarkWebhookReq struct {
+	Status       string `json:"status"` // "benchmark"
+	WorkerName   string `json:"workername"`
+	TargetPuzzle string `json:"targetpuzzle"`
+	Hashrate     string `json:"hashrate"`
+	ElapsedSec   float64 `json:"elapsed_sec"`
+	KeysChecked  uint64 `json:"keys_checked"`
+	RangeStart   string `json:"range_start"`
+	RangeEnd     string `json:"range_end"`
+	Found        bool   `json:"found"`
+	PrivateKey   string `json:"privatekey,omitempty"`
+	Address      string `json:"address,omitempty"`
+	Hash160      string `json:"hash160,omitempty"`
+	Hardware     string `json:"hardware"`
+	Threads      int    `json:"threads"`
+	Lanes        int    `json:"lanes"`
+}
+
 type MilestoneReq struct {
 	WorkerID    string `json:"worker_id"`
 	Milestone   int    `json:"milestone"`
@@ -179,7 +198,11 @@ func main() {
 		cfg.Puzzle = 10
 	} else {
 		p, err := strconv.Atoi(puzzleStr)
-		if err == nil && p > 0 {
+		if err == nil {
+			if p < 1 || p > 160 {
+				logError(cfg.StealthMode, "[-] Puzzle inválido: %d (use 1–160)", p)
+				os.Exit(1)
+			}
 			cfg.Puzzle = p
 		}
 	}
@@ -313,93 +336,181 @@ logInfo(cfg.StealthMode, "[+] Worker registrado com sucesso: %s", cfg.WorkerName
 }
 
 func runTestMode(client *http.Client, cfg Config, h *hash160er, stealth bool) {
-	testKey, ok := knownTestKeys[cfg.Puzzle]
-	if !ok {
-		logError(stealth, "[TEST] ❌ Puzzle %d não possui chave de teste conhecida. Use --puzzle 5, 10, 20 ou 30 com --test", cfg.Puzzle)
+	// Legacy path kept for knownTestKeys fallback; real benchmark uses runRealBenchmark.
+	runRealBenchmark(client, cfg, h, stealth)
+}
+
+// runRealBenchmark performs linear brute-force from 2^(N-1) with real hash160
+// comparison for puzzles 1–32. Blocks benchmark for P71–160 (production via Hub).
+func runRealBenchmark(client *http.Client, cfg Config, h *hash160er, stealth bool) {
+	if cfg.Puzzle < 1 || cfg.Puzzle > 160 {
+		logError(stealth, "[BENCH] ❌ Puzzle %d inválido. Use 1–160.", cfg.Puzzle)
 		return
 	}
-	
-	logInfo(stealth, "[TEST] 🔬 Modo Benchmark Ativado — Puzzle #%d (Chave Conhecida)", cfg.Puzzle)
-	logInfo(stealth, "[TEST] 🎯 Alvo: Endereço %s | Chave: 0x%s", testKey.Address, strings.TrimLeft(testKey.PrivateKeyHex, "0"))
-	
-	startBig := hexToBigInt(testKey.StartHex)
-	endBig := hexToBigInt(testKey.EndHex)
+	if cfg.Puzzle > 32 {
+		logError(stealth, "[BENCH] ❌ Benchmark real disponível apenas para P1–32. P%d use produção via Hub (/api/range/next?puzzle=%d).", cfg.Puzzle, cfg.Puzzle)
+		return
+	}
+
+	p, ok := getPuzzle(cfg.Puzzle)
+	if !ok {
+		logError(stealth, "[BENCH] ❌ Puzzle %d não encontrado no dataset data/puzzles.json.", cfg.Puzzle)
+		return
+	}
+
+	targetHash := strings.ToLower(strings.TrimSpace(p.Hash160))
+	if targetHash == "" {
+		logError(stealth, "[BENCH] ❌ Puzzle %d sem hash160 no dataset.", cfg.Puzzle)
+		return
+	}
+
+	// Linear range from 2^(N-1) (dataset minHex) to maxHex
+	startHex, endHex := puzzleRangeBounds(p)
+	if startHex == "" || endHex == "" {
+		startHex, endHex = defaultBenchmarkRange(cfg.Puzzle)
+	}
+	startBig := hexToBigInt(startHex)
+	endBig := hexToBigInt(endHex)
 	totalKeys := new(big.Int).Sub(endBig, startBig)
-	
-	logInfo(stealth, "[TEST] 📊 Range de teste: 0x%s ➔ 0x%s (~%d chaves)", testKey.StartHex, testKey.EndHex, totalKeys.Uint64())
-	
-	bases := make([]*big.Int, 1)
-	bases[0] = startBig
-	
+	totalKeys.Add(totalKeys, big.NewInt(1))
+	if totalKeys.Sign() <= 0 {
+		logError(stealth, "[BENCH] ❌ Range inválido para puzzle %d.", cfg.Puzzle)
+		return
+	}
+
+	logInfo(stealth, "[BENCH] 🔬 Benchmark real — Puzzle #%d | %d bits | Range 0x%s–0x%s (~%s chaves)", cfg.Puzzle, p.Bits, startHex, endHex, totalKeys.String())
+	logInfo(stealth, "[BENCH] 🎯 Alvo: %s | hash160 %s", p.Address, targetHash)
+
+	lanes := cfg.Lanes
+	if lanes < 1 {
+		lanes = 1
+	}
+	// Do not use more lanes than keys in range
+	if int64(lanes) > totalKeys.Int64() {
+		lanes = int(totalKeys.Int64())
+	}
+
+	bases := make([]*big.Int, lanes)
+	for i := range bases {
+		bases[i] = new(big.Int).Add(startBig, big.NewInt(int64(i)))
+	}
 	ls := newLaneSet(bases)
-	
-	G := generatorPoint()
-	
-	var totalIter uint64
-	
-	logInfo(stealth, "[TEST] 🔍 Iniciando busca no range de teste...")
-	
-	var tick uint64
+
+	// Precompute G*lanes so one advance() jumps all lanes by `lanes` (non-overlapping linear)
+	var gStep btcec.JacobianPoint
+	{
+		var nScalar btcec.ModNScalar
+		var nBytes [32]byte
+		binary.BigEndian.PutUint64(nBytes[24:], uint64(lanes))
+		nScalar.SetByteSlice(nBytes[:])
+		btcec.ScalarBaseMultNonConst(&nScalar, &gStep)
+	}
+
+	startTime := time.Now()
+	var keysChecked uint64
+	var foundKey string
 	found := false
-	
-	for !found {
-		_ = ls.forEachHash(h, func(lane int, h160 []byte) bool {
-			key := new(big.Int).Add(bases[lane], big.NewInt(int64(tick)))
-			keyHex := padPrivateKey(key.Bytes(), 32)
-			
-			if strings.EqualFold(keyHex, testKey.PrivateKeyHex) {
-				found = true
-				logInfo(stealth, "[SUCCESS] 🎯 CHAVE DE TESTE LOCALIZADA COM SUCESSO!")
-				logInfo(stealth, "[SUCCESS] 🔑 Chave Privada: %s", keyHex)
-				logInfo(stealth, "[SUCCESS] 📍 Endereço: %s", testKey.Address)
-				
-				filename := fmt.Sprintf("KEY_FOUND_TEST_P%d_%s.txt", cfg.Puzzle, time.Now().Format("20060102_150405"))
-				content := fmt.Sprintf("Private Key: %s\nHash160: %s\nAddress: %s\nType: TEST\nPuzzle: %d\nFound at: %s\nWorker: %s\n",
-					keyHex, "7c076a65c3f7b5b8b8b8b8b8b8b8b8b8b8b8b8b8", testKey.Address, cfg.Puzzle, time.Now().Format(time.RFC3339), cfg.WorkerName)
-				os.WriteFile(filename, []byte(content), 0600)
-				logInfo(stealth, "[SUCCESS] 💾 Arquivo salvo: %s", filename)
-				
-				// Send webhook with x-nexus-secret header
-				payload := KeyFoundReq{
-					Status:       "keyFound",
-					PrivateKey:   keyHex,
-					WorkerName:   cfg.WorkerName,
-					TargetPuzzle: strconv.Itoa(cfg.Puzzle),
-					LoteID:       "TEST_MODE",
+	maxSteps := (totalKeys.Uint64() + uint64(lanes) - 1) / uint64(lanes)
+
+	for step := uint64(0); step < maxSteps && !found; step++ {
+		ls.forEachHash(h, func(lane int, h160 []byte) bool {
+			if strings.EqualFold(hex.EncodeToString(h160), targetHash) {
+				key := new(big.Int).Add(startBig, big.NewInt(int64(lane)+int64(step)*int64(lanes)))
+				if key.Cmp(endBig) <= 0 {
+					foundKey = padPrivateKey(key.Bytes(), 32)
+					found = true
+					keysChecked++
+					return true
 				}
-				body, _ := json.Marshal(payload)
-				req, _ := http.NewRequest("POST", cfg.HubURL+"/api/webhook/btcpuzzle", bytes.NewReader(body))
-				req.Header.Set("Content-Type", "application/json")
-				req.Header.Set("x-nexus-secret", "SenhaMuitoForteFamilia123")
-				client.Do(req)
-				logInfo(stealth, "[SUCCESS] 📡 Webhook disparado para Hub com x-nexus-secret")
-				
-				return true
 			}
 			return false
 		})
-		
-		atomic.AddUint64(&totalIter, 1)
-		tick++
-		
-		if tick%1000 == 0 {
-			ls.advance(&G)
+		if !found {
+			keysChecked += uint64(lanes)
 		}
-		
-		if found {
-			break
-		}
-		
-		if tick > totalKeys.Uint64()+10 {
-			logWarn(stealth, "[TEST] ⚠️ Chave não encontrada no range esperado")
-			break
+		// Jump all lanes forward by `lanes` (one EC add of precomputed G*lanes per point)
+		ls.advance(&gStep)
+
+		if step > 0 && (step%1000 == 0 || step == maxSteps-1) {
+			elapsed := time.Since(startTime).Seconds()
+			rate := float64(keysChecked) / elapsed
+			logInfo(stealth, "[BENCH] ⏳ %d/%s chaves | %.2f kH/s | %.1fs", keysChecked, totalKeys.String(), rate/1000, elapsed)
 		}
 	}
-	
+
+	elapsed := time.Since(startTime)
+	if keysChecked == 0 {
+		keysChecked = 1
+	}
+	hashrateF := float64(keysChecked) / elapsed.Seconds()
+	if hashrateF < 1 {
+		hashrateF = 1
+	}
+	hashrateStr := fmt.Sprintf("%.2f kH/s", hashrateF/1000)
+
 	if found {
-		logInfo(stealth, "[TEST] ✅ Benchmark concluído com sucesso em %d iterações", tick)
+		logInfo(stealth, "[BENCH] ✅ Chave localizada em %.2fs (%d chaves, %s)", elapsed.Seconds(), keysChecked, hashrateStr)
+		logInfo(stealth, "[BENCH] 🔑 Private Key: %s", foundKey)
+		logInfo(stealth, "[BENCH] 📍 Address: %s", p.Address)
+		if p.PrivKey != "" && !strings.EqualFold(strings.TrimLeft(p.PrivKey, "0"), strings.TrimLeft(foundKey, "0")) {
+			logWarn(stealth, "[BENCH] ⚠️ Chave encontrada difere do privKey do dataset (verificar hash160)")
+		}
 	} else {
-		logError(stealth, "[TEST] ❌ Benchmark falhou - chave não encontrada")
+		logWarn(stealth, "[BENCH] ⚠️ Chave não encontrada no range completo (%d chaves verificadas)", keysChecked)
+	}
+
+	// Save BENCHMARK_REAL_P<N>.txt
+	filename := fmt.Sprintf("BENCHMARK_REAL_P%d.txt", cfg.Puzzle)
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "Puzzle: %d\n", cfg.Puzzle)
+	fmt.Fprintf(&sb, "Bits: %d\n", p.Bits)
+	fmt.Fprintf(&sb, "Range: 0x%s - 0x%s\n", startHex, endHex)
+	fmt.Fprintf(&sb, "Total keys in range: %s\n", totalKeys.String())
+	fmt.Fprintf(&sb, "Keys checked: %d\n", keysChecked)
+	fmt.Fprintf(&sb, "Elapsed: %.3f s\n", elapsed.Seconds())
+	fmt.Fprintf(&sb, "Hashrate: %s\n", hashrateStr)
+	fmt.Fprintf(&sb, "Found: %v\n", found)
+	if found {
+		fmt.Fprintf(&sb, "Private Key: %s\n", foundKey)
+	}
+	fmt.Fprintf(&sb, "Address: %s\n", p.Address)
+	fmt.Fprintf(&sb, "Hash160: %s\n", targetHash)
+	fmt.Fprintf(&sb, "Worker: %s\n", cfg.WorkerName)
+	fmt.Fprintf(&sb, "Hardware: CPU_GO_MONTGOMERY | Threads: %d | Lanes: %d\n", runtime.NumCPU(), lanes)
+	fmt.Fprintf(&sb, "Timestamp: %s\n", time.Now().Format(time.RFC3339))
+	if err := os.WriteFile(filename, []byte(sb.String()), 0600); err != nil {
+		logWarn(stealth, "[BENCH] ⚠️ Falha ao salvar %s: %v", filename, err)
+	} else {
+		logInfo(stealth, "[BENCH] 💾 Arquivo salvo: %s", filename)
+	}
+
+	// Webhook status=benchmark with x-nexus-secret
+	payload := BenchmarkWebhookReq{
+		Status:       "benchmark",
+		WorkerName:   cfg.WorkerName,
+		TargetPuzzle: strconv.Itoa(cfg.Puzzle),
+		Hashrate:     hashrateStr,
+		ElapsedSec:   elapsed.Seconds(),
+		KeysChecked:  keysChecked,
+		RangeStart:   "0x" + startHex,
+		RangeEnd:     "0x" + endHex,
+		Found:        found,
+		PrivateKey:   foundKey,
+		Address:      p.Address,
+		Hash160:      targetHash,
+		Hardware:     "CPU_GO_MONTGOMERY",
+		Threads:      runtime.NumCPU(),
+		Lanes:        lanes,
+	}
+	body, _ := json.Marshal(payload)
+	req, _ := http.NewRequest("POST", cfg.HubURL+"/api/webhook/btcpuzzle", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("x-nexus-secret", "SenhaMuitoForteFamilia123")
+	if resp, err := client.Do(req); err == nil {
+		resp.Body.Close()
+		logInfo(stealth, "[BENCH] 📡 Webhook benchmark disparado (status=benchmark)")
+	} else {
+		logWarn(stealth, "[BENCH] ⚠️ Webhook benchmark falhou: %v", err)
 	}
 }
 
@@ -422,10 +533,9 @@ func runWorkerLoop(client *http.Client, cfg Config) {
 
 	stealth := cfg.StealthMode
 
-	// Test mode: use known key for instant validation
-	if cfg.TestMode {
-		h := newHash160er()
-		runTestMode(client, cfg, h, stealth)
+	// Test/benchmark mode OR P1–32: real linear brute-force from 2^(N-1)
+	if cfg.TestMode || (cfg.Puzzle >= 1 && cfg.Puzzle <= 32) {
+		runRealBenchmark(client, cfg, h, stealth)
 		return
 	}
 

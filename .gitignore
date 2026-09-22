@@ -1,11 +1,13 @@
 # Binaries
 *.exe
 worker_linux_amd64
-worker
+/worker
 bitcoin_finder
 bitcoin_finder.exe
 
 # Temporary / keys
 found_key_*.txt
+KEY_FOUND_TEST_*.txt
+BENCHMARK_REAL_P*.txt
 temp/
 *.log
