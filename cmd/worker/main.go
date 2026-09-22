@@ -124,7 +124,7 @@ func main() {
 	cpuFlag := flag.Int("cpu", 0, "CPU usage percent (1-100), overrides CPU_PERCENT env")
 	threadsFlag := flag.Int("threads", 0, "Manual thread override, overrides THREADS env")
 	stealthFlag := flag.Bool("stealth", false, "Stealth mode for academic/cloud environments")
-	puzzleFlag := flag.Int("puzzle", 0, "Puzzle number (71, 130, etc). Overrides PUZZLE env. Use 'test' or 0 for test mode")
+	puzzleFlag := flag.String("puzzle", "71", "Puzzle number (71, 130, etc) or 'test'/'0' for test mode. Overrides PUZZLE env.")
 	flag.Parse()
 
 	if *cpuFlag > 0 {
@@ -136,11 +136,15 @@ func main() {
 	if *stealthFlag {
 		cfg.StealthMode = true
 	}
-	if *puzzleFlag > 0 {
-		cfg.Puzzle = *puzzleFlag
-		if cfg.Puzzle == -1 || cfg.Puzzle == 0 {
-			cfg.TestMode = true
-			cfg.Puzzle = 10
+
+	puzzleStr := *puzzleFlag
+	if puzzleStr == "test" || puzzleStr == "0" {
+		cfg.TestMode = true
+		cfg.Puzzle = 10
+	} else {
+		p, err := strconv.Atoi(puzzleStr)
+		if err == nil && p > 0 {
+			cfg.Puzzle = p
 		}
 	}
 
