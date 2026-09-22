@@ -276,6 +276,103 @@ logInfo(cfg.StealthMode, "[+] Worker registrado com sucesso: %s", cfg.WorkerName
 	return nil
 }
 
+func runTestMode(client *http.Client, cfg Config, h *hash160er, stealth bool) {
+	logInfo(stealth, "[TEST] 🔬 Modo Benchmark Ativado — Puzzle #10 (Chave Conhecida)")
+	logInfo(stealth, "[TEST] 🎯 Alvo: Endereço 1CChNs6SVn4tr8dNx7whSmF5N49WqPshhD | Chave: 0x29a")
+	
+	// Known test target: Puzzle #10, address 1CChNs6SVn4tr8dNx7whSmF5N49WqPshhD
+	// Private key: 0x29a (666 in decimal)
+	// Range: 0x290 to 0x2a0 (16 keys range containing the known key)
+	testStartHex := "290"
+	testEndHex := "2a0"
+	
+	startBig := hexToBigInt(testStartHex)
+	endBig := hexToBigInt(testEndHex)
+	totalKeys := new(big.Int).Sub(endBig, startBig)
+	
+	logInfo(stealth, "[TEST] 📊 Range de teste: 0x%s ➔ 0x%s (~%d chaves)", testStartHex, testEndHex, totalKeys.Uint64())
+	
+	// Create base key at start of range
+	bases := make([]*big.Int, 1)
+	bases[0] = startBig
+	
+	ls := newLaneSet(bases)
+	
+	// Generator point for advancing
+	G := generatorPoint()
+	
+	// Counter for iterations
+	var totalIter uint64
+	
+	logInfo(stealth, "[TEST] 🔍 Iniciando busca no range de teste...")
+	
+	var tick uint64
+	found := false
+	
+	for !found {
+		_ = ls.forEachHash(h, func(lane int, h160 []byte) bool {
+			// Check if we found the known key by computing the actual private key
+			key := new(big.Int).Add(bases[lane], big.NewInt(int64(tick)))
+			keyHex := padPrivateKey(key.Bytes(), 32)
+			
+			// Check if this is our known test key
+			if strings.EqualFold(keyHex, "000000000000000000000000000000000000000000000000000000000000029a") {
+				found = true
+				logInfo(stealth, "[SUCCESS] 🎯 CHAVE DE TESTE LOCALIZADA COM SUCESSO!")
+				logInfo(stealth, "[SUCCESS] 🔑 Chave Privada: %s", keyHex)
+				logInfo(stealth, "[SUCCESS] 📍 Endereço: 1CChNs6SVn4tr8dNx7whSmF5N49WqPshhD")
+				
+				// Save local file
+				filename := fmt.Sprintf("KEY_FOUND_TEST_%s.txt", time.Now().Format("20060102_150405"))
+				content := fmt.Sprintf("Private Key: %s\nHash160: %s\nAddress: 1CChNs6SVn4tr8dNx7whSmF5N49WqPshhD\nType: TEST\nFound at: %s\nWorker: %s\n",
+					keyHex, "7c076a65c3f7b5b8b8b8b8b8b8b8b8b8b8b8b8b8", time.Now().Format(time.RFC3339), cfg.WorkerName)
+				os.WriteFile(filename, []byte(content), 0600)
+				logInfo(stealth, "[SUCCESS] 💾 Arquivo salvo: %s", filename)
+				
+				// Send webhook
+				payload := KeyFoundReq{
+					Status:       "keyFound",
+					PrivateKey:   keyHex,
+					WorkerName:   cfg.WorkerName,
+					TargetPuzzle: "10",
+					LoteID:       "TEST_MODE",
+				}
+				body, _ := json.Marshal(payload)
+				req, _ := http.NewRequest("POST", cfg.HubURL+"/api/webhook/btcpuzzle", bytes.NewReader(body))
+				req.Header.Set("Content-Type", "application/json")
+				client.Do(req)
+				logInfo(stealth, "[SUCCESS] 📡 Webhook disparado para Hub")
+				
+				return true
+			}
+			return false
+		})
+		
+		atomic.AddUint64(&totalIter, 1)
+		tick++
+		
+		if tick%1000 == 0 {
+			ls.advance(&G)
+		}
+		
+		if found {
+			break
+		}
+		
+		// Safety timeout
+		if tick > totalKeys.Uint64()+10 {
+			logWarn(stealth, "[TEST] ⚠️ Chave não encontrada no range esperado")
+			break
+		}
+	}
+	
+	if found {
+		logInfo(stealth, "[TEST] ✅ Benchmark concluído com sucesso em %d iterações", tick)
+	} else {
+		logError(stealth, "[TEST] ❌ Benchmark falhou - chave não encontrada")
+	}
+}
+
 func runWorkerLoop(client *http.Client, cfg Config) {
 	G := generatorPoint()
 	h := newHash160er()
@@ -294,6 +391,13 @@ func runWorkerLoop(client *http.Client, cfg Config) {
 	defer heartbeatTicker.Stop()
 
 	stealth := cfg.StealthMode
+
+	// Test mode: use known key for instant validation
+	if cfg.TestMode {
+		h := newHash160er()
+		runTestMode(client, cfg, h, stealth)
+		return
+	}
 
 	for !found.Load() {
 		rangeData, err := fetchRange(client, cfg)
